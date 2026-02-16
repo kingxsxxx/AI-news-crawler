@@ -30,7 +30,6 @@ pub struct CrawlResult {
 struct CrawledArticle {
     title: String,
     url: String,
-    summary: String,
     content: String,
     published_at: String,
     image_url: Option<String>,
@@ -119,13 +118,19 @@ fn seed_default_sources(conn: &Connection) -> Result<(), rusqlite::Error> {
         ("GitHub Trending TypeScript", "https://github.com/trending/typescript", "WEB", true),
         ("GitHub Trending Rust", "https://github.com/trending/rust", "WEB", true),
 
-        // Tech news RSS feeds (more reliable)
+        // Tech news RSS feeds (reliable sources)
         ("Dev.to AI Tag", "https://dev.to/feed/tag/ai", "RSS", true),
         ("Reddit MachineLearning", "https://www.reddit.com/r/MachineLearning/.rss", "RSS", true),
 
-        // Chinese tech sites (may need special handling)
+        // Additional reliable AI/Tech RSS feeds
+        ("The Verge AI", "https://www.theverge.com/ai-ml/rss", "RSS", true),
+        ("Ars Technica AI", "https://arstechnica.com/ai/feed/", "RSS", true),
+        ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/", "RSS", true),
+
+        // Chinese tech sites (reliable sources)
         ("OSChina 资讯", "https://www.oschina.net/news/rss", "RSS", true),
         ("V2EX 技术新穗", "https://www.v2ex.com/index.xml", "RSS", true),
+        ("InfoQ 中文", "https://www.infoq.cn/feed", "RSS", true),
     ];
 
     let mut stmt = conn.prepare(
@@ -520,10 +525,27 @@ async fn settings_get(state: State<'_, DbState>) -> Result<Settings, String> {
 
     // Get settings from DB or use defaults
     let theme = get_setting(&conn, "theme", "auto")?;
-    let ai_model = get_setting(&conn, "ai_model", "qwen3-max")?;
+    let ai_model = get_setting(&conn, "ai_model", "")?;
     let ai_base_url = get_setting(&conn, "ai_base_url", "")?;
     let ai_api_key = get_setting(&conn, "ai_api_key", "")?;
     let ai_summary_enabled = get_setting(&conn, "ai_summary_enabled", "true")? == "true";
+
+    // Fallback to environment variables if database is empty
+    let ai_model = if ai_model.is_empty() {
+        std::env::var("AI_MODEL").unwrap_or_else(|_| "qwen3-max".to_string())
+    } else {
+        ai_model
+    };
+    let ai_base_url = if ai_base_url.is_empty() {
+        std::env::var("AI_BASE_URL").unwrap_or_default()
+    } else {
+        ai_base_url
+    };
+    let ai_api_key = if ai_api_key.is_empty() {
+        std::env::var("AI_API_KEY").unwrap_or_default()
+    } else {
+        ai_api_key
+    };
 
     Ok(Settings {
         theme,
@@ -575,19 +597,23 @@ fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> 
 // AI summarize - calls OpenAI-compatible API
 #[tauri::command]
 async fn ai_summarize(state: State<'_, DbState>, content: String) -> Result<String, String> {
-    // Get settings from database
+    // Get settings from database first, then fallback to environment variables
     let (base_url, api_key, model) = {
         let conn = state.conn.lock().map_err(|e| format!("db lock: {}", e))?;
-        let base_url = get_setting(&conn, "ai_base_url", "")?;
-        let api_key = get_setting(&conn, "ai_api_key", "")?;
-        let model = get_setting(&conn, "ai_model", "qwen3-max")?;
+        let db_base_url = get_setting(&conn, "ai_base_url", "").ok().filter(|s| !s.is_empty());
+        let db_api_key = get_setting(&conn, "ai_api_key", "").ok().filter(|s| !s.is_empty());
+        let db_model = get_setting(&conn, "ai_model", "").ok().filter(|s| !s.is_empty());
+
+        // Try database first, then environment variables
+        let base_url = db_base_url.or_else(|| std::env::var("AI_BASE_URL").ok())
+            .ok_or_else(|| "请先在设置中配置 AI API Base URL".to_string())?;
+        let api_key = db_api_key.or_else(|| std::env::var("AI_API_KEY").ok())
+            .ok_or_else(|| "请先在设置中配置 AI API Key".to_string())?;
+        let model = db_model.or_else(|| std::env::var("AI_MODEL").ok())
+            .unwrap_or_else(|| "qwen3-max".to_string());
+
         (base_url, api_key, model)
     };
-
-    // Validate configuration
-    if base_url.is_empty() || api_key.is_empty() {
-        return Err("请先在设置中配置 AI API (Base URL 和 API Key)".to_string());
-    }
 
     // Build request - AI APIs usually need proxy for international services
     // But if using Chinese AI services (like DashScope), they work without proxy
@@ -651,30 +677,46 @@ struct SummaryUpdateCompleteEvent {
     total_processed: usize,
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct SummaryUpdateErrorEvent {
-    message: String,
-}
-
 // Batch regenerate summaries
 #[tauri::command]
 async fn articles_regenerate_summaries(
     state: State<'_, DbState>,
     app: AppHandle,
 ) -> Result<usize, String> {
-    // Collect all articles first, then release the lock
+    // Check if AI summarization is enabled and configured (from environment variables or database)
+    let ai_config = {
+        let conn = state.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
+        let db_base_url = get_setting(&conn, "ai_base_url", "").ok().filter(|s| !s.is_empty());
+        let db_api_key = get_setting(&conn, "ai_api_key", "").ok().filter(|s| !s.is_empty());
+        let db_model = get_setting(&conn, "ai_model", "").ok().filter(|s| !s.is_empty());
+
+        let base_url = db_base_url.or_else(|| std::env::var("AI_BASE_URL").ok());
+        let api_key = db_api_key.or_else(|| std::env::var("AI_API_KEY").ok());
+        let model = db_model.or_else(|| std::env::var("AI_MODEL").ok()).unwrap_or_else(|| "qwen3-max".to_string());
+
+        if let (Some(url), Some(key)) = (base_url, api_key) {
+            Some((url, key, model))
+        } else {
+            None
+        }
+    };
+
+    if ai_config.is_none() {
+        return Err("请先在设置中配置 AI API (Base URL 和 API Key)，或确保 .env 文件中有正确的配置".to_string());
+    }
+
+    // Collect all articles with template summaries that need regeneration
     let articles = {
         let conn = state.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
         let mut stmt = conn.prepare(
-            "SELECT id, title, summary, content FROM articles WHERE summary LIKE '%这篇英文资讯围绕%'"
+            "SELECT id, title, content FROM articles WHERE summary LIKE '%这篇英文资讯围绕%' OR summary IS NULL OR summary = ''"
         ).map_err(|e| format!("prepare failed: {e}"))?;
 
-        let result: Vec<(String, String, String, String)> = stmt.query_map([], |row| {
+        let result: Vec<(String, String, String)> = stmt.query_map([], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
                 row.get(2)?,
-                row.get(3)?,
             ))
         }).map_err(|e| format!("query failed: {e}"))?
         .into_iter()
@@ -693,7 +735,7 @@ async fn articles_regenerate_summaries(
     let start_payload = SummaryUpdateStartEvent { total };
     let _ = app.emit("app://summaries-update:start", start_payload);
 
-    for (index, (id, title, old_summary, _content)) in articles.into_iter().enumerate() {
+    for (index, (id, title, content)) in articles.into_iter().enumerate() {
         let current = index + 1;
 
         // Emit progress event
@@ -705,35 +747,45 @@ async fn articles_regenerate_summaries(
         };
         let _ = app.emit("app://summaries-update:progress", progress_payload);
 
-        // Generate new summary (for now, just keep old one)
-        // In real implementation, would call AI API
-        let new_summary = old_summary.clone();
+        // Generate new summary using AI
+        let new_summary = if let Some((ref base_url, ref api_key, ref model)) = ai_config {
+            // Create a new HTTP client for each request
+            let http_client = create_http_client(true)?;
+            match generate_ai_summary(&Some(http_client), base_url, api_key, model, &title, &content).await {
+                Ok(ai_summary) => ai_summary,
+                Err(e) => {
+                    eprintln!("AI summary failed for '{}', using template: {}", title, e);
+                    make_zh_brief(&title, &content, "批量更新")
+                }
+            }
+        } else {
+            make_zh_brief(&title, &content, "批量更新")
+        };
 
-        if !new_summary.contains("这篇英文资讯围绕") && !new_summary.contains("建议点击标题") {
-            // Update database - need to acquire lock again
+        // Update database - need to acquire lock again
+        {
             let conn = state.conn.lock().map_err(|_| "db lock poisoned".to_string())?;
-            let update_result = conn.execute(
+            conn.execute(
                 "UPDATE articles SET summary = ?1 WHERE id = ?2",
                 params![new_summary, id]
-            ).map_err(|e| format!("update failed: {e}"));
-            drop(conn);
+            ).map_err(|e| format!("update failed: {e}"))?;
+        } // conn is dropped here
 
-            update_result?;
+        updated += 1;
 
-            updated += 1;
+        // Emit updated progress
+        let progress_payload = SummaryUpdateProgressEvent {
+            current,
+            total,
+            title: title.clone(),
+            updated,
+        };
+        let _ = app.emit("app://summaries-update:progress", progress_payload);
 
-            // Emit updated progress
-            let progress_payload = SummaryUpdateProgressEvent {
-                current,
-                total,
-                title: title.clone(),
-                updated,
-            };
-            let _ = app.emit("app://summaries-update:progress", progress_payload);
+        // Rate limiting between AI calls
+        if ai_config.is_some() {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
-
-        // Add small delay to avoid rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     // Emit complete event
@@ -774,19 +826,50 @@ async fn crawler_run_once(state: State<'_, DbState>) -> Result<CrawlResult, Stri
         sources
     }; // Release the lock before async operations
 
-    let mut inserted_total = 0;
+    // Check if AI summarization is enabled and configured (from environment variables)
+    let ai_config = {
+        let ai_base_url = std::env::var("AI_BASE_URL").unwrap_or_default();
+        let ai_api_key = std::env::var("AI_API_KEY").unwrap_or_default();
+        let ai_model = std::env::var("AI_MODEL").unwrap_or_else(|_| "qwen3-max".to_string());
+
+        if !ai_base_url.is_empty() && !ai_api_key.is_empty() {
+            Some((ai_base_url, ai_api_key, ai_model))
+        } else {
+            None
+        }
+    };
+
     let mut failed_sources_count = 0;
 
-    // Fetch articles from all sources (without database operations)
-    let mut all_articles: Vec<(String, Vec<CrawledArticle>)> = Vec::new();
+    // Fetch articles from all sources and generate summaries
+    let mut articles_to_insert: Vec<(String, CrawledArticle, String)> = Vec::new();
 
     for (source_name, source_url, source_type) in sources_data {
         let result = fetch_articles_from_source(&source_name, &source_url, &source_type).await;
 
         match result {
             Ok(articles) => {
-                if !articles.is_empty() {
-                    all_articles.push((source_name.clone(), articles));
+                for article in articles {
+                    // Generate summary using AI if configured, otherwise use template
+                    let summary = if let Some((ref base_url, ref api_key, ref model)) = ai_config {
+                        let http_client = create_http_client(true)?;
+                        match generate_ai_summary(&Some(http_client), base_url, api_key, model, &article.title, &article.content).await {
+                            Ok(ai_summary) => ai_summary,
+                            Err(e) => {
+                                eprintln!("AI summary failed for '{}', using template: {}", article.title, e);
+                                make_zh_brief(&article.title, &article.content, &source_name)
+                            }
+                        }
+                    } else {
+                        make_zh_brief(&article.title, &article.content, &source_name)
+                    };
+
+                    articles_to_insert.push((source_name.clone(), article, summary));
+
+                    // Rate limiting between AI calls
+                    if ai_config.is_some() {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    }
                 }
             },
             Err(e) => {
@@ -797,51 +880,50 @@ async fn crawler_run_once(state: State<'_, DbState>) -> Result<CrawlResult, Stri
     }
 
     // Now store all articles using the shared connection
+    let mut inserted_total = 0;
     {
         let conn = state.conn.lock().map_err(|e| format!("db lock poisoned: {}", e))?;
 
-        for (source_name, articles) in all_articles {
-            for article in articles {
-                // Check if article already exists
-                let exists: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM articles WHERE url = ?1)",
-                    params![&article.url],
-                    |row| row.get(0)
-                ).unwrap_or(false);
+        for (source_name, article, summary) in articles_to_insert {
+            // Check if article already exists
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM articles WHERE url = ?1)",
+                params![&article.url],
+                |row| row.get(0)
+            ).unwrap_or(false);
 
-                if !exists {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    let category = categorize_source(&source_name);
+            if !exists {
+                let id = uuid::Uuid::new_v4().to_string();
+                let category = categorize_source(&source_name);
 
-                    // Insert into articles table
-                    conn.execute(
-                        "INSERT INTO articles (id, title, summary, content, url, source, category, published_at, fetched_at, image_url)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                        params![
-                            &id,
-                            &article.title,
-                            &article.summary,
-                            &article.content,
-                            &article.url,
-                            &source_name,
-                            &category,
-                            &article.published_at,
-                            &chrono::Utc::now().to_rfc3339(),
-                            &article.image_url.unwrap_or_default()
-                        ]
-                    ).map_err(|e| format!("Insert article failed: {}", e))?;
+                // Insert into articles table
+                conn.execute(
+                    "INSERT INTO articles (id, title, summary, content, url, source, category, published_at, fetched_at, image_url)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        &id,
+                        &article.title,
+                        &summary,
+                        &article.content,
+                        &article.url,
+                        &source_name,
+                        &category,
+                        &article.published_at,
+                        &chrono::Utc::now().to_rfc3339(),
+                        &article.image_url.unwrap_or_default()
+                    ]
+                ).map_err(|e| format!("Insert article failed: {}", e))?;
 
-                    // Get the integer rowid for FTS
-                    let rowid: i64 = conn.last_insert_rowid();
+                // Get the integer rowid for FTS
+                let rowid: i64 = conn.last_insert_rowid();
 
-                    // Insert into FTS table using integer rowid
-                    conn.execute(
-                        "INSERT INTO articles_fts (rowid, title, summary, content) VALUES (?1, ?2, ?3, ?4)",
-                        params![rowid, &article.title, &article.summary, &article.content]
-                    ).map_err(|e| format!("Insert into FTS failed: {}", e))?;
+                // Insert into FTS table using integer rowid
+                conn.execute(
+                    "INSERT INTO articles_fts (rowid, title, summary, content) VALUES (?1, ?2, ?3, ?4)",
+                    params![rowid, &article.title, &summary, &article.content]
+                ).map_err(|e| format!("Insert into FTS failed: {}", e))?;
 
-                    inserted_total += 1;
-                }
+                inserted_total += 1;
             }
         }
     }
@@ -859,7 +941,14 @@ async fn crawler_run_once(state: State<'_, DbState>) -> Result<CrawlResult, Stri
 async fn fetch_articles_from_source(source_name: &str, url: &str, source_type: &str) -> Result<Vec<CrawledArticle>, String> {
     match source_type {
         "RSS" => fetch_rss_feed(source_name, url).await,
-        "WEB" => fetch_web_page(source_name, url).await,
+        "WEB" => {
+            // Check if this is a GitHub trending URL
+            if url.contains("github.com/trending") {
+                fetch_github_trending(source_name, url).await
+            } else {
+                fetch_web_page(source_name, url).await
+            }
+        },
         _ => Ok(Vec::new())
     }
 }
@@ -936,7 +1025,11 @@ async fn fetch_rss_feed(source_name: &str, url: &str) -> Result<Vec<CrawledArtic
         .get(url)
         .header("Accept", "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8")
         .header("Accept-Language", "en-US,en;q=0.9")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .header("Referer", "https://www.google.com/")
+        .header("sec-ch-ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"")
+        .header("sec-ch-ua-mobile", "?0")
+        .header("sec-ch-ua-platform", "\"Windows\"")
         .send().await
         .map_err(|e| format!("HTTP request failed: {}", e))?;
 
@@ -944,7 +1037,14 @@ async fn fetch_rss_feed(source_name: &str, url: &str) -> Result<Vec<CrawledArtic
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
     // Check if response is HTML instead of XML/RSS (common anti-bot response)
-    if content.contains("<!DOCTYPE html>") || content.contains("Just a moment") || content.contains("Checking your browser") || content.contains("Access Denied") {
+    let content_lower = content.to_lowercase();
+    if content_lower.contains("<!doctype html")
+        || content_lower.contains("just a moment")
+        || content_lower.contains("checking your browser")
+        || content_lower.contains("access denied")
+        || content_lower.contains("<title>404")
+        || content_lower.contains("page not found")
+        || content_lower.contains("<html") {
         eprintln!("RSS feed {} returned HTML instead of RSS/XML (possible anti-bot protection), skipping: {}", source_name, url);
         return Ok(Vec::new());
     }
@@ -964,8 +1064,8 @@ async fn fetch_rss_feed(source_name: &str, url: &str) -> Result<Vec<CrawledArtic
     for item in channel.items().iter().take(12) {
         if let Some(title) = item.title() {
             if let Some(link) = item.link() {
-                let summary = item.description().unwrap_or("No description available").to_string();
-                let content = summary.clone();
+                let description = item.description().unwrap_or("No description available").to_string();
+                let content = description.clone();
                 let pub_date = item.pub_date().unwrap_or("");
                 let normalized_date = normalize_datetime(pub_date);
                 let image_url = item.enclosure().map(|e| e.url.to_string());
@@ -973,7 +1073,6 @@ async fn fetch_rss_feed(source_name: &str, url: &str) -> Result<Vec<CrawledArtic
                 articles.push(CrawledArticle {
                     title: title.to_string(),
                     url: normalize_url(link),
-                    summary: make_zh_brief(title, &content, source_name),
                     content,
                     published_at: normalized_date,
                     image_url,
@@ -986,7 +1085,7 @@ async fn fetch_rss_feed(source_name: &str, url: &str) -> Result<Vec<CrawledArtic
 }
 
 // Fetch web page and return articles (no database operations)
-async fn fetch_web_page(source_name: &str, url: &str) -> Result<Vec<CrawledArticle>, String> {
+async fn fetch_web_page(_source_name: &str, url: &str) -> Result<Vec<CrawledArticle>, String> {
     let use_proxy = !is_chinese_site(url);
     let client = create_http_client(use_proxy)?;
 
@@ -1017,7 +1116,6 @@ async fn fetch_web_page(source_name: &str, url: &str) -> Result<Vec<CrawledArtic
                     articles.push(CrawledArticle {
                         title: title.clone(),
                         url: normalize_url(&abs_url),
-                        summary: make_zh_brief(&title, &content, source_name),
                         content,
                         published_at: now.clone(),
                         image_url: None,
@@ -1028,6 +1126,157 @@ async fn fetch_web_page(source_name: &str, url: &str) -> Result<Vec<CrawledArtic
     }
 
     Ok(articles)
+}
+
+// Fetch GitHub trending projects with quality filtering
+async fn fetch_github_trending(source_name: &str, url: &str) -> Result<Vec<CrawledArticle>, String> {
+    let use_proxy = true; // GitHub needs proxy for international access
+    let client = create_http_client(use_proxy)?;
+
+    let response = client
+        .get(url)
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .send().await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    let content = response.text().await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    // First pass: extract all project data from trending page
+    let mut projects_data: Vec<(String, String, String, String, u32)> = Vec::new();
+
+    {
+        let document = scraper::Html::parse_document(&content);
+
+        // GitHub trending article selector
+        let article_selector = scraper::Selector::parse("article.Box-row").map_err(|e| format!("Invalid selector: {}", e))?;
+
+        for row in document.select(&article_selector) {
+            if let Some(name_element) = row.select(&scraper::Selector::parse("h2 a").unwrap()).next() {
+                let project_url = name_element.value().attr("href").unwrap_or("").to_string();
+                let project_name = name_element.text().collect::<String>().trim().to_string();
+
+                let description = row
+                    .select(&scraper::Selector::parse("p").unwrap())
+                    .next()
+                    .map(|el| el.text().collect::<String>().trim().to_string())
+                    .unwrap_or_default();
+
+                let language = row
+                    .select(&scraper::Selector::parse("span[itemprop='programmingLanguage']").unwrap())
+                    .next()
+                    .map(|el| el.text().collect::<String>().trim().to_string())
+                    .unwrap_or_default();
+
+                let stars_text = row
+                    .select(&scraper::Selector::parse("a[href$='/stargazers']").unwrap())
+                    .next()
+                    .map(|el| el.text().collect::<String>().trim().to_string())
+                    .unwrap_or_default();
+                let stars = parse_number(&stars_text);
+
+                projects_data.push((project_url, project_name, description, language, stars));
+            }
+        }
+        drop(document); // Explicitly drop document before await
+    }
+
+    let mut articles = Vec::new();
+    let now = chrono::Utc::now();
+
+    // Second pass: fetch project pages and apply quality filter
+    for (project_url, project_name, description, language, stars) in projects_data {
+        if project_url.is_empty() {
+            continue;
+        }
+
+        // Get project created time by fetching project page
+        let full_url = format!("https://github.com{}", project_url);
+        let created_at = fetch_github_project_created(&client, &full_url).await;
+
+        // Quality filter based on project age
+        // - New projects (< 2 weeks): stars > 20k
+        // - Recent projects (< 2 months): stars > 30k
+        // - Old projects (>= 2 months): stars > 10k
+        let is_quality = if let Some(created_time) = created_at {
+            let age_days = (now - created_time).num_days();
+            if age_days < 14 {
+                stars > 20000
+            } else if age_days < 60 {
+                stars > 30000
+            } else {
+                stars > 10000
+            }
+        } else {
+            // Cannot determine age, use default threshold
+            stars > 10000
+        };
+
+        if is_quality {
+            let language_info = if !language.is_empty() { format!(" [{}]", language) } else { String::new() };
+            let title = format!("{}{}", project_name, language_info);
+            let content = if !description.is_empty() { description.clone() } else { "GitHub trending project".to_string() };
+
+            articles.push(CrawledArticle {
+                title,
+                url: normalize_url(&full_url),
+                content,
+                published_at: now.to_rfc3339(),
+                image_url: None,
+            });
+        }
+    }
+
+    println!("GitHub Trending [{}]: found {} quality projects (filtered)", source_name, articles.len());
+    Ok(articles)
+}
+
+// Fetch GitHub project page to get created time
+async fn fetch_github_project_created(client: &reqwest::Client, url: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let response = client
+        .get(url)
+        .header("Accept", "text/html")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+
+    let content = response.text().await.ok()?;
+    let document = scraper::Html::parse_document(&content);
+
+    // Look for relative time element with created date
+    // GitHub uses <relative-time> elements for timestamps
+    for time_elem in document.select(&scraper::Selector::parse("relative-time").unwrap()) {
+        if let Some(datetime) = time_elem.value().attr("datetime") {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(datetime) {
+                return Some(dt.with_timezone(&chrono::Utc));
+            }
+        }
+    }
+
+    // Alternative: look for time element with specific class
+    for time_elem in document.select(&scraper::Selector::parse("time").unwrap()) {
+        if let Some(datetime) = time_elem.value().attr("datetime") {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(datetime) {
+                return Some(dt.with_timezone(&chrono::Utc));
+            }
+        }
+    }
+
+    None
+}
+
+// Parse number from GitHub's format (e.g., "1.2k" -> 1200, "15.5k" -> 15500)
+fn parse_number(text: &str) -> u32 {
+    let text = text.replace(',', "").replace(' ', "");
+    if text.to_lowercase().ends_with('k') {
+        let num: f64 = text[..text.len()-1].parse().unwrap_or(0.0);
+        (num * 1000.0) as u32
+    } else {
+        text.parse().unwrap_or(0)
+    }
 }
 
 // Helper function to normalize URLs (as mentioned in the documentation)
@@ -1052,7 +1301,93 @@ fn categorize_source(source_name: &str) -> String {
 
 // Helper function to make Chinese brief summary (template as fallback)
 fn make_zh_brief(title: &str, content: &str, _source: &str) -> String {
-    format!("这篇英文资讯围绕「{}」展开，介绍了{}等关键内容。建议点击标题查看原文。", title, if content.len() > 20 { &content[..20] } else { content })
+    let safe_content = if content.chars().count() > 20 {
+        content.chars().take(20).collect::<String>()
+    } else {
+        content.to_string()
+    };
+    format!("这篇英文资讯围绕「{}」展开，介绍了{}等关键内容。建议点击标题查看原文。", title, safe_content)
+}
+
+// Generate AI summary with exponential backoff retry
+async fn generate_ai_summary(
+    client: &Option<reqwest::Client>,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    title: &str,
+    content: &str,
+) -> Result<String, String> {
+    let client = client.as_ref().ok_or_else(|| "HTTP client not initialized".to_string())?;
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    // Truncate content to avoid token limits (use chars to avoid UTF-8 boundary issues)
+    let truncated_content = if content.chars().count() > 3000 {
+        content.chars().take(3000).collect::<String>()
+    } else {
+        content.to_string()
+    };
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "请用中文总结以下内容，控制在 100 字以内，突出重点信息。"},
+            {"role": "user", "content": format!("标题：{}\n\n内容：{}", title, truncated_content)}
+        ],
+        "max_tokens": 200
+    });
+
+    // Exponential backoff retry (3 attempts: 2s, 4s, 8s delays)
+    let mut attempts = 0;
+    let delays = [2, 4, 8];
+
+    loop {
+        attempts += 1;
+
+        let response = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    let json: serde_json::Value = resp.json().await
+                        .map_err(|e| format!("解析响应失败：{}", e))?;
+
+                    if let Some(summary) = json["choices"][0]["message"]["content"].as_str() {
+                        return Ok(summary.to_string());
+                    } else {
+                        return Err("API 响应格式错误".to_string());
+                    }
+                } else {
+                    let status = resp.status();
+                    let error_text = resp.text().await.unwrap_or_default();
+                    eprintln!("AI API error ({}): {}", status, error_text);
+
+                    if attempts >= 3 {
+                        return Err(format!("API 返回错误 ({}): {}", status, error_text));
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("AI request attempt {} failed: {}", attempts, e);
+
+                if attempts >= 3 {
+                    return Err(format!("API 请求失败：{}", e));
+                }
+            }
+        }
+
+        // Wait before retry
+        if attempts < 3 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(delays[attempts - 1])).await;
+        }
+    }
 }
 
 // Helper function to normalize date/time formats to ISO 8601

@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/article/articlecard.tsx","./src/components/article/articlelist.tsx","./src/components/common/categorybadge.tsx","./src/components/common/emptystate.tsx","./src/components/common/heatindicator.tsx","./src/components/settings/summaryupdateprogress.tsx","./src/lib/api.ts","./src/types/index.ts"],"version":"5.9.3"}
