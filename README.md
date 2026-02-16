@@ -182,4 +182,4 @@ A: 存储在系统应用数据目录下：
 
 ## License
 
-MIT
+Apache 2.0 - 详见 [LICENSE](LICENSE) 文件
